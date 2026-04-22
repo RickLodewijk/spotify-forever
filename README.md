@@ -39,7 +39,6 @@ Dit installeert:
 - `spotipy` - Spotify API client
 - `python-dotenv` - Environment variabelen (.env files)
 - `streamlit` - Interactive dashboard
-- `pandas` - Data manipulation
 - `plotly` - Interactieve grafieken
 - `sqlite3` - Komt standaard met Python
 

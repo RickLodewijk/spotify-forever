@@ -1,10 +1,10 @@
 import os
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
+from collections import defaultdict
 
-import pandas as pd
 import plotly.express as px
 import spotipy
 import streamlit as st
@@ -49,7 +49,7 @@ def pick_column(columns: List[str], candidates: List[str], label: str) -> str:
     raise ValueError(f"Geen bruikbare kolom gevonden voor {label}. Gezocht: {candidates}")
 
 
-def load_streams_df(conn: sqlite3.Connection) -> pd.DataFrame:
+def load_stream_rows(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     columns = get_table_columns(conn, "plays")
 
     ts_col = pick_column(columns, ["ts"], "timestamp")
@@ -67,15 +67,31 @@ def load_streams_df(conn: sqlite3.Connection) -> pd.DataFrame:
         WHERE {ms_col} IS NOT NULL AND {ms_col} > 0
     """
 
-    df = pd.read_sql_query(query, conn)
-    if df.empty:
-        return df
+    raw_rows = conn.execute(query).fetchall()
+    cleaned_rows: List[Dict[str, Any]] = []
 
-    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    df = df.dropna(subset=["ts", "artist", "track", "ms_played"])
-    df["ms_played"] = pd.to_numeric(df["ms_played"], errors="coerce")
-    df = df.dropna(subset=["ms_played"])
-    return df
+    for ts, artist, track, ms_played in raw_rows:
+        if ts is None or artist is None or track is None or ms_played is None:
+            continue
+
+        try:
+            ms_played_int = int(ms_played)
+        except (TypeError, ValueError):
+            continue
+
+        if ms_played_int <= 0:
+            continue
+
+        cleaned_rows.append(
+            {
+                "ts": str(ts),
+                "artist": str(artist),
+                "track": str(track),
+                "ms_played": ms_played_int,
+            }
+        )
+
+    return cleaned_rows
 
 
 def clear_auth_cache() -> None:
@@ -166,77 +182,113 @@ def get_now_playing(sp: spotipy.Spotify) -> Dict[str, str]:
     }
 
 
-def render_overview(df: pd.DataFrame) -> None:
-    total_minutes = float(df["ms_played"].sum()) / 60000.0
-    unique_artists = int(df["artist"].nunique())
+def render_overview(rows: List[Dict[str, Any]]) -> None:
+    total_minutes = float(sum(row["ms_played"] for row in rows)) / 60000.0
+    unique_artists = len({row["artist"] for row in rows})
 
     c1, c2 = st.columns(2)
     c1.metric("Totaal geluisterde minuten", f"{total_minutes:,.0f}")
     c2.metric("Unieke artiesten", f"{unique_artists:,}")
 
 
-def render_top_artists(df: pd.DataFrame) -> None:
-    agg = (
-        df.groupby("artist", as_index=False)["ms_played"]
-        .sum()
-        .sort_values("ms_played", ascending=False)
-        .head(10)
-    )
-    agg["hours_played"] = agg["ms_played"] / 3_600_000.0
+def render_top_artists(rows: List[Dict[str, Any]]) -> None:
+    artist_ms: Dict[str, int] = defaultdict(int)
+    for row in rows:
+        artist_ms[row["artist"]] += row["ms_played"]
+
+    top_artists: List[Tuple[str, int]] = sorted(
+        artist_ms.items(), key=lambda item: item[1], reverse=True
+    )[:10]
+
+    if not top_artists:
+        st.info("Nog geen artiestdata beschikbaar.")
+        return
+
+    artists = [artist for artist, _ in top_artists]
+    hours_played = [ms_played / 3_600_000.0 for _, ms_played in top_artists]
 
     fig = px.bar(
-        agg,
-        x="artist",
-        y="hours_played",
+        x=artists,
+        y=hours_played,
         title="Top 10 meest beluisterde artiesten (uren)",
-        labels={"artist": "Artiest", "hours_played": "Luistertijd (uren)"},
-        hover_data={"hours_played": ":.2f", "ms_played": True},
+        labels={"x": "Artiest", "y": "Luistertijd (uren)"},
     )
     fig.update_layout(xaxis_tickangle=-35)
     st.plotly_chart(fig, use_container_width=True)
 
-def render_track_search(df: pd.DataFrame) -> None:
+def render_track_search(rows: List[Dict[str, Any]]) -> None:
     st.subheader("Zoek op nummer")
     search_term = st.text_input("Zoek op tracknaam", placeholder="Bijv. Blinding Lights")
 
-    track_agg = (
-        df.groupby(["track", "artist"], as_index=False)
-        .agg(
-            ms_played=("ms_played", "sum"),
-            play_count=("ms_played", "size"),
+    track_stats: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for row in rows:
+        key = (row["track"], row["artist"])
+        if key not in track_stats:
+            track_stats[key] = {"ms_played": 0, "play_count": 0}
+        track_stats[key]["ms_played"] += row["ms_played"]
+        track_stats[key]["play_count"] += 1
+
+    track_agg: List[Dict[str, Any]] = []
+    for (track, artist), stats in track_stats.items():
+        track_agg.append(
+            {
+                "track": track,
+                "artist": artist,
+                "ms_played": stats["ms_played"],
+                "play_count": stats["play_count"],
+                "minutes_played": stats["ms_played"] / 60000.0,
+            }
         )
-        .sort_values("ms_played", ascending=False)
-    )
-    track_agg["minutes_played"] = track_agg["ms_played"] / 60000.0
+    track_agg.sort(key=lambda item: item["ms_played"], reverse=True)
 
     if not search_term.strip():
         st.caption("Voer een tracknaam in om je luistertijd te zien.")
         st.dataframe(
-            track_agg[["track", "artist", "minutes_played", "play_count"]].head(10),
+            [
+                {
+                    "track": item["track"],
+                    "artist": item["artist"],
+                    "minutes_played": item["minutes_played"],
+                    "play_count": item["play_count"],
+                }
+                for item in track_agg[:10]
+            ],
             use_container_width=True,
             hide_index=True,
         )
         return
 
-    filtered = track_agg[track_agg["track"].str.contains(search_term, case=False, na=False)].copy()
-    if filtered.empty:
+    search_term_lower = search_term.lower()
+    filtered = [
+        item for item in track_agg if search_term_lower in str(item["track"]).lower()
+    ]
+
+    if not filtered:
         st.warning("Geen nummers gevonden voor deze zoekterm.")
         return
 
-    total_minutes_for_search = float(filtered["minutes_played"].sum())
-    total_count_for_search = int(filtered["play_count"].sum())
+    total_minutes_for_search = float(sum(item["minutes_played"] for item in filtered))
+    total_count_for_search = int(sum(item["play_count"] for item in filtered))
 
     c1, c2 = st.columns(2)
     c1.metric("Totale luistertijd voor zoekresultaat (minuten)", f"{total_minutes_for_search:,.1f}")
     c2.metric("Totaal aantal keer afgespeeld", f"{total_count_for_search:,}")
 
-    top_match = filtered.iloc[0]
+    top_match = filtered[0]
     st.success(
         f"Top match: {top_match['track']} - {top_match['artist']} ({top_match['minutes_played']:.1f} minuten, {int(top_match['play_count'])}x afgespeeld)"
     )
 
     st.dataframe(
-        filtered[["track", "artist", "minutes_played", "play_count"]],
+        [
+            {
+                "track": item["track"],
+                "artist": item["artist"],
+                "minutes_played": item["minutes_played"],
+                "play_count": item["play_count"],
+            }
+            for item in filtered
+        ],
         use_container_width=True,
         hide_index=True,
     )
@@ -427,14 +479,14 @@ def main() -> None:
 
     conn = get_connection(db_path)
     try:
-        df = load_streams_df(conn)
+        rows = load_stream_rows(conn)
     except Exception as exc:
         st.error(f"Kon data niet laden uit database: {exc}")
         return
     finally:
         conn.close()
 
-    if df.empty:
+    if not rows:
         st.info("Nog geen streamdata beschikbaar in de database.")
         render_json_upload_section(db_path)
         if enable_now_playing:
@@ -443,9 +495,9 @@ def main() -> None:
             st.info("Eerste sync is uitgevoerd. Zodra er genoeg luisterdata is, verschijnt die hier.")
         return
 
-    render_overview(df)
+    render_overview(rows)
     st.divider()
-    render_top_artists(df)
+    render_top_artists(rows)
     st.divider()
     if enable_now_playing:
         render_now_playing(sp)
@@ -453,7 +505,7 @@ def main() -> None:
         st.subheader("Nu aan het luisteren")
         st.info("Zet in de sidebar 'Nu aan het luisteren ophalen via Spotify API' aan als je live current track wilt tonen.")
     st.divider()
-    render_track_search(df)
+    render_track_search(rows)
     st.divider()
     render_json_upload_section(db_path)
     st.divider()

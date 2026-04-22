@@ -9,6 +9,9 @@ Een Python-gebaseerd systeem om je Spotify-luistergeschiedenis vast te leggen, o
 - **JSON Import**: Eenmalige ingest van Spotify Extended Streaming History exports.
 - **30-seconden Filter**: Sla alleen nummers op waarbij je langer dan 30 seconden hebt geluisterd.
 - **Interactief Dashboard**: Streamlit-webinterface met:
+   - Verplichte Spotify-login voordat je dashboard zichtbaar is
+   - Optionele auto-sync na login (recent afgespeelde tracks direct opslaan)
+   - JSON upload in dashboard (EndsSong_*.json direct importeren)
   - Totaaloverzicht (minuten + artiesten)
   - Top 10 artiesten per luistertijd
   - Zoekfunctie op tracknaam met speelcount
@@ -54,6 +57,7 @@ Vul je Spotify credentials in:
 SPOTIPY_CLIENT_ID=jouw_client_id_hier
 SPOTIPY_CLIENT_SECRET=jouw_client_secret_hier
 SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
+SPOTIPY_DASHBOARD_REDIRECT_URI=http://localhost:8501
 ```
 
 ## 🔐 Spotify Developer Setup
@@ -67,10 +71,14 @@ SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
 5. Voeg Redirect URI toe bij Edit Settings:
    ```
    http://127.0.0.1:8888/callback
+   http://localhost:8501
    ```
 6. Klik Save
 
 Zet dezelfde waarden exact in je `.env`.
+
+`SPOTIPY_REDIRECT_URI` wordt gebruikt door de tracker (terminal flow).
+`SPOTIPY_DASHBOARD_REDIRECT_URI` wordt gebruikt door het Streamlit dashboard (in-app login flow).
 
 > ⚠️ **Belangrijk**: Client Secret niet delen! Als je deze publiek maakt, genereer meteen een nieuwe.
 
@@ -107,6 +115,8 @@ Het dashboard opent automatisch op:
 - **Lokaal**: http://localhost:8501
 - **Netwerk**: http://<JOUW-LAPTOP-IP>:8501
 
+Je krijgt eerst een Spotify login-knop te zien. Na succesvol inloggen wordt je dashboard geladen.
+
 Vind je IP met: `ipconfig` → IPv4-adres opspoort.
 
 ## 📊 Dashboard Werken
@@ -124,6 +134,11 @@ Vind je IP met: `ipconfig` → IPv4-adres opspoort.
 - Zie totaal minuten en aantal speelt
 - Top match resultaat
 
+### JSON Upload
+- Upload 1 of meerdere `EndsSong_*.json` bestanden direct in het dashboard
+- Stel minimale luistertijd in (standaard 30000 ms)
+- Krijg direct aantallen: toegevoegd, duplicaten, korter dan minimum, ongeldig
+
 ### Tijdlijn
 - Kies tussen Uren/Minuten
 - Dagweergave met 7-daags gemiddelde
@@ -137,6 +152,7 @@ Vind je IP met: `ipconfig` → IPv4-adres opspoort.
 - **SQLite databasepad**: Waar je database opgeslagen is
 - **Auto-refresh**: Hoe lang wachten voor vernieuwen (0 = uit)
 - **Nu aan het luisteren ophalen**: Toggle voor live Spotify current track
+- **Na login recent afgespeelde tracks opslaan**: Schrijft direct je recent played data naar SQLite
 
 ## 🗄️ Database Schema
 
@@ -180,6 +196,7 @@ Dit importeert alle `EndsSong_*.json` bestanden en voegt ze toe aan dezelfde dat
 2. Zet exact dezelfde Redirect URI bij Redirect URIs:
    ```
    http://127.0.0.1:8888/callback
+   http://localhost:8501
    ```
 3. Klik Save
 4. Verwijder cache en probeer opnieuw:
@@ -199,13 +216,20 @@ Dit importeert alle `EndsSong_*.json` bestanden en voegt ze toe aan dezelfde dat
    ```
 2. Database wordt automatisch aangemaakt bij start.
 
-### "Ontbrekende omgevingsvariabelen: SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET, SPOTIPY_REDIRECT_URI"
+### "Ontbrekende omgevingsvariabelen (Spotify)"
 
 **Oorzaak:** .env ingevuld maar niet geladen.
 
 **Oplossing:**
 1. Controleer of `.env` in correct pad staat (projectmap)
-2. Zeg het script explicit:
+2. Controleer dat minimaal deze keys aanwezig zijn:
+   ```env
+   SPOTIPY_CLIENT_ID=...
+   SPOTIPY_CLIENT_SECRET=...
+   SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
+   SPOTIPY_DASHBOARD_REDIRECT_URI=http://localhost:8501
+   ```
+3. Zeg het script expliciet:
    ```powershell
    & "C:/Users/anous/Documents/spotify forever/.venv/Scripts/python.exe" "spotify_long_term_tracker.py" run --env-file ".env"
    ```

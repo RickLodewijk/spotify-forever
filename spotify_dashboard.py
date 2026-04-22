@@ -2,6 +2,7 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional
+import json
 
 import pandas as pd
 import plotly.express as px
@@ -10,8 +11,20 @@ import streamlit as st
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyOAuth
 
+from spotify_long_term_tracker import (
+    fetch_and_store_recent,
+    get_db_connection,
+    insert_play,
+    normalize_ts,
+)
+
 
 DASHBOARD_CACHE_PATH = ".cache-spotify-dashboard"
+LOGIN_SCOPE = "user-read-currently-playing user-read-recently-played"
+
+
+def get_dashboard_redirect_uri() -> Optional[str]:
+    return os.environ.get("SPOTIPY_DASHBOARD_REDIRECT_URI") or os.environ.get("SPOTIPY_REDIRECT_URI")
 
 
 def load_environment(env_file: str = ".env") -> None:
@@ -65,20 +78,72 @@ def load_streams_df(conn: sqlite3.Connection) -> pd.DataFrame:
     return df
 
 
-def build_spotify_client() -> Optional[spotipy.Spotify]:
-    required = ["SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI"]
+def clear_auth_cache() -> None:
+    cache_path = Path(DASHBOARD_CACHE_PATH)
+    if cache_path.exists() and cache_path.is_file():
+        cache_path.unlink()
+
+
+def require_spotify_login() -> spotipy.Spotify:
+    required = ["SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET"]
     missing = [k for k in required if not os.environ.get(k)]
+    redirect_uri = get_dashboard_redirect_uri()
+
     if missing:
-        return None
-
-    redirect_uri = os.environ.get("SPOTIPY_REDIRECT_URI", "")
-    if "code=" in redirect_uri or "error=" in redirect_uri:
-        raise ValueError(
-            "SPOTIPY_REDIRECT_URI is ongeldig. Gebruik een vaste callback URI zoals http://127.0.0.1:8888/callback"
+        st.error(
+            "Spotify variabelen ontbreken. Vul SPOTIPY_CLIENT_ID en SPOTIPY_CLIENT_SECRET in .env in."
         )
+        st.stop()
 
-    scope = "user-read-currently-playing"
-    auth_manager = SpotifyOAuth(scope=scope, cache_path=DASHBOARD_CACHE_PATH)
+    if not redirect_uri:
+        st.error(
+            "Redirect URI ontbreekt. Vul SPOTIPY_DASHBOARD_REDIRECT_URI (of SPOTIPY_REDIRECT_URI) in .env in."
+        )
+        st.stop()
+
+    if "code=" in redirect_uri or "error=" in redirect_uri:
+        st.error(
+            "De redirect URI is ongeldig. Gebruik een vaste URI zoals http://localhost:8501."
+        )
+        st.stop()
+
+    auth_manager = SpotifyOAuth(
+        redirect_uri=redirect_uri,
+        scope=LOGIN_SCOPE,
+        cache_path=DASHBOARD_CACHE_PATH,
+        show_dialog=False,
+    )
+
+    query_params = st.query_params
+    auth_error = query_params.get("error")
+    if auth_error:
+        st.error(f"Spotify login mislukt: {auth_error}")
+        if st.button("Opnieuw proberen"):
+            st.query_params.clear()
+            st.rerun()
+        st.stop()
+
+    token_info = auth_manager.get_cached_token()
+    auth_code = query_params.get("code")
+
+    if not token_info and auth_code:
+        try:
+            auth_manager.get_access_token(auth_code, as_dict=True)
+            st.query_params.clear()
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Kon Spotify callback niet verwerken: {exc}")
+            st.stop()
+
+    token_info = auth_manager.get_cached_token()
+    if not token_info:
+        st.title("Spotify Long-term Tracker Dashboard")
+        st.subheader("Log in met Spotify")
+        st.write("Je moet eerst inloggen met Spotify voordat je dashboard zichtbaar wordt.")
+        auth_url = auth_manager.get_authorize_url()
+        st.link_button("Inloggen met Spotify", auth_url, use_container_width=True)
+        st.stop()
+
     return spotipy.Spotify(auth_manager=auth_manager)
 
 
@@ -177,14 +242,9 @@ def render_track_search(df: pd.DataFrame) -> None:
     )
 
 
-def render_now_playing() -> None:
+def render_now_playing(sp: spotipy.Spotify) -> None:
     st.subheader("Nu aan het luisteren")
     try:
-        sp = build_spotify_client()
-        if not sp:
-            st.warning("Spotify variabelen ontbreken. Vul SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET en SPOTIPY_REDIRECT_URI in .env in.")
-            return
-
         now_playing = get_now_playing(sp)
         if now_playing.get("status") != "Speelt nu":
             st.info(now_playing["status"])
@@ -198,16 +258,140 @@ def render_now_playing() -> None:
         st.error(f"Kon huidige track niet ophalen: {exc}")
 
 
+def import_uploaded_endsong_files(
+    conn: sqlite3.Connection,
+    uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile],
+    min_ms_played: int,
+) -> Dict[str, int]:
+    inserted = 0
+    skipped_short = 0
+    duplicates = 0
+    invalid_rows = 0
+
+    for uploaded_file in uploaded_files:
+        try:
+            payload = json.loads(uploaded_file.getvalue().decode("utf-8"))
+        except Exception:
+            invalid_rows += 1
+            continue
+
+        if not isinstance(payload, list):
+            invalid_rows += 1
+            continue
+
+        for row in payload:
+            if not isinstance(row, dict):
+                invalid_rows += 1
+                continue
+
+            ts_raw = row.get("ts")
+            if not ts_raw:
+                invalid_rows += 1
+                continue
+
+            try:
+                ms_played = int(row.get("ms_played") or 0)
+            except (TypeError, ValueError):
+                invalid_rows += 1
+                continue
+
+            if ms_played < min_ms_played:
+                skipped_short += 1
+                continue
+
+            try:
+                play = {
+                    "ts": normalize_ts(str(ts_raw)),
+                    "source": "spotify_export",
+                    "track_name": row.get("master_metadata_track_name"),
+                    "artist_name": row.get("master_metadata_album_artist_name"),
+                    "album_name": row.get("master_metadata_album_album_name"),
+                    "track_uri": row.get("spotify_track_uri"),
+                    "ms_played": ms_played,
+                    "reason_end": row.get("reason_end"),
+                    "skipped": 1 if row.get("skipped") else 0,
+                    "raw_json": row,
+                }
+                was_inserted = insert_play(conn, play)
+            except Exception:
+                invalid_rows += 1
+                continue
+
+            if was_inserted:
+                inserted += 1
+            else:
+                duplicates += 1
+
+    return {
+        "inserted": inserted,
+        "skipped_short": skipped_short,
+        "duplicates": duplicates,
+        "invalid_rows": invalid_rows,
+    }
+
+
+def render_json_upload_section(db_path: str, default_min_ms_played: int = 30000) -> None:
+    st.subheader("JSON upload (Spotify export)")
+    st.caption("Upload 1 of meerdere EndsSong_*.json bestanden om historische luisterdata in te laden.")
+
+    min_ms_played = st.number_input(
+        "Minimale luistertijd (ms)",
+        min_value=0,
+        max_value=600000,
+        value=default_min_ms_played,
+        step=1000,
+    )
+
+    uploaded_files = st.file_uploader(
+        "Kies EndsSong JSON-bestanden",
+        type=["json"],
+        accept_multiple_files=True,
+        help="Je kunt meerdere bestanden in een keer uploaden.",
+    )
+
+    if not uploaded_files:
+        return
+
+    st.write(f"Geselecteerde bestanden: {len(uploaded_files)}")
+
+    if st.button("Importeer JSON naar database", use_container_width=True):
+        conn = get_db_connection(db_path)
+        try:
+            result = import_uploaded_endsong_files(
+                conn,
+                uploaded_files,
+                min_ms_played=int(min_ms_played),
+            )
+        finally:
+            conn.close()
+
+        st.success(
+            "Import klaar: "
+            f"+{result['inserted']} toegevoegd, "
+            f"{result['duplicates']} duplicaten, "
+            f"{result['skipped_short']} korter dan minimum, "
+            f"{result['invalid_rows']} ongeldig"
+        )
+
+
 def main() -> None:
     load_environment()
 
     st.set_page_config(page_title="Spotify Long-term Dashboard", layout="wide")
+    sp = require_spotify_login()
+
     st.title("Spotify Long-term Tracker Dashboard")
 
     st.sidebar.header("Instellingen")
     db_path = st.sidebar.text_input("SQLite databasepad", value="spotify_tracker.db")
     refresh_seconds = st.sidebar.slider("Auto-refresh (seconden)", 0, 300, 30, 5)
     enable_now_playing = st.sidebar.checkbox("Nu aan het luisteren ophalen via Spotify API", value=False)
+    enable_auto_sync = st.sidebar.checkbox("Na login recent afgespeelde tracks opslaan", value=True)
+
+    if st.sidebar.button("Uitloggen (Spotify)"):
+        clear_auth_cache()
+        st.query_params.clear()
+        st.rerun()
 
     if refresh_seconds > 0:
         st.markdown(
@@ -215,8 +399,30 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
+    sync_message_shown = False
+    if enable_auto_sync:
+        try:
+            sync_conn = get_db_connection(db_path)
+            try:
+                inserted, skipped_short, duplicates = fetch_and_store_recent(
+                    sync_conn,
+                    sp,
+                    min_ms_played=30000,
+                    limit=50,
+                )
+            finally:
+                sync_conn.close()
+
+            st.sidebar.success(
+                f"Sync klaar: +{inserted} toegevoegd, {skipped_short} kort, {duplicates} duplicaat"
+            )
+            sync_message_shown = True
+        except Exception as exc:
+            st.sidebar.error(f"Auto-sync mislukt: {exc}")
+
     if not Path(db_path).exists():
         st.error(f"Database niet gevonden: {db_path}")
+        st.info("Na je Spotify-login wordt de database automatisch aangemaakt zodra een sync slaagt.")
         return
 
     conn = get_connection(db_path)
@@ -230,7 +436,11 @@ def main() -> None:
 
     if df.empty:
         st.info("Nog geen streamdata beschikbaar in de database.")
-        render_now_playing()
+        render_json_upload_section(db_path)
+        if enable_now_playing:
+            render_now_playing(sp)
+        elif sync_message_shown:
+            st.info("Eerste sync is uitgevoerd. Zodra er genoeg luisterdata is, verschijnt die hier.")
         return
 
     render_overview(df)
@@ -238,12 +448,14 @@ def main() -> None:
     render_top_artists(df)
     st.divider()
     if enable_now_playing:
-        render_now_playing()
+        render_now_playing(sp)
     else:
         st.subheader("Nu aan het luisteren")
         st.info("Zet in de sidebar 'Nu aan het luisteren ophalen via Spotify API' aan als je live current track wilt tonen.")
     st.divider()
     render_track_search(df)
+    st.divider()
+    render_json_upload_section(db_path)
     st.divider()
 
 
